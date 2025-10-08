@@ -1,5 +1,15 @@
 package main
 
+// net-guard: CLI to manage pinned eBPF programs and maps.
+//
+// Features:
+// - XDP allow/deny: CIDR-based allow LPM (v4/v6) and per-IP deny hashes.
+// - TC per-source token-bucket: per-IP policies with LRU state maps.
+//
+// The CLI loads eBPF object files, pins programs/maps under /sys/fs/bpf
+// (or expects them pinned), and provides commands to modify the maps from
+// userspace so the eBPF programs can act on updated data immediately.
+
 import (
 	"errors"
 	"flag"
@@ -20,7 +30,7 @@ const (
 	objXDP = "xdp_allow_deny.bpf.o" // expects prog: xdp_allow_then_deny
 	objTC  = "tc_rl.bpf.o"          // expects SEC("tc")
 
-	// Pinned map paths (MÜSSEN mit den BPF-C-Namen übereinstimmen)
+	// Pinned map paths (MUST match the BPF C map names)
 	// IPv4
 	mapPinAllow4LPM = "/sys/fs/bpf/xdp_allow_lpm"
 	mapPinDeny4Hash = "/sys/fs/bpf/xdp_deny_hash"
@@ -28,7 +38,7 @@ const (
 	mapPinAllow6LPM = "/sys/fs/bpf/xdp_allow6_lpm"
 	mapPinDeny6Hash = "/sys/fs/bpf/xdp_deny6_hash"
 
-	// Config (gemeinsam)
+	// Config (shared)
 	mapPinXDPCfg = "/sys/fs/bpf/xdp_cfg"
 
 	// tc rate-limiter 
@@ -40,12 +50,18 @@ const (
 
 /* ==================== Helpers ==================== */
 
+// waitForSignal blocks until SIGINT or SIGTERM is received. Used to keep
+// long-running attach commands alive until the user requests shutdown.
 func waitForSignal() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
 }
-
+// ipToKeys parses a textual IP and returns:
+// - isV4: true if IPv4
+// - k4:  4-byte key for IPv4 maps (network order)
+// - k6:  16-byte key for IPv6 maps
+// This helper is used when inserting/deleting per-IP entries in maps.
 func ipToKeys(ipstr string) (isV4 bool, k4 [4]byte, k6 [16]byte, err error) {
     ip := net.ParseIP(ipstr)
     if ip == nil {
@@ -64,6 +80,8 @@ func ipToKeys(ipstr string) (isV4 bool, k4 [4]byte, k6 [16]byte, err error) {
 }
 
 
+// must is a small helper that exits the program on error with a message.
+// It keeps the command code concise by handling fatal errors in a single place.
 func must(err error, msg string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %s: %v\n", msg, err)
@@ -71,10 +89,16 @@ func must(err error, msg string) {
 	}
 }
 
+// openPinnedMap opens a map that was pinned under /sys/fs/bpf by the
+// BPF loader or by this CLI previously. The function returns the Go
+// representation of the map which must be closed by the caller when done.
 func openPinnedMap(path string) (*ebpf.Map, error) {
 	return ebpf.LoadPinnedMap(path, nil)
 }
 
+// ifaceIndexByName returns the kernel interface index for a given name.
+// It calls must() internally to exit on error since index lookup is
+// required for attaching XDP programs.
 func ifaceIndexByName(name string) int {
 	ifi, err := net.InterfaceByName(name)
 	must(err, "InterfaceByName")
@@ -93,17 +117,22 @@ type lpmKey6 struct {
 }
 
 type xdpCfg struct {
-	EnforceAllow uint32 // 0=off, 1=on (default-deny außerhalb Allowlist)
+	EnforceAllow uint32 // 0=off, 1=on (default-deny for addresses outside the allowlist)
 }
 
 func cmdAttachXDP(iface string) {
-	// bpffs sicherstellen: sudo mount -t bpf bpf /sys/fs/bpf || true
+	// Attach the pre-compiled XDP program to `iface`.
+	// This loads the eBPF object, which may also create and pin maps under
+	// /sys/fs/bpf if they are declared with pinning. The XDP program name
+	// expected in the object is "xdp_allow_then_deny".
+	//
+	// Note: ensure bpffs is mounted if not already: sudo mount -t bpf bpf /sys/fs/bpf || true
 	spec, err := ebpf.LoadCollectionSpec(objXDP)
 	must(err, "load xdp spec")
 
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{
-			PinPath: "/sys/fs/bpf", // nötig für LIBBPF_PIN_BY_NAME in v0.19
+			PinPath: "/sys/fs/bpf", // required for LIBBPF_PIN_BY_NAME in v0.19
 		},
 	})
 	must(err, "new xdp collection (with PinPath)")
@@ -137,6 +166,9 @@ func cmdAttachXDP(iface string) {
 /* ---------- Allow CIDR (v4+v6, auto-detect) ---------- */
 
 func cmdAddAllowCIDR(cidr string) {
+	// Add the given CIDR to the XDP allow LPM trie. The function auto-detects
+	// IPv4 vs IPv6 and writes the proper key format expected by the kernel
+	// LPM trie (prefixlen followed by network bytes in big-endian order).
 	_, ipnet, err := net.ParseCIDR(cidr)
 	must(err, "parse CIDR")
 
@@ -393,34 +425,39 @@ func ensureClsact(iface string) error {
 }
 
 func cmdAttachTC(iface string) {
-    // Absoluter Pfad ist robuster
+	// Attach the TC (clsact) filter using the pinned program.
+	// This sequence loads the BPF object, ensures maps are pinned (via
+	// MapOptions.PinPath) and pins the program itself, then installs a
+	// clsact ingress filter pointing at the pinned program path.
+
+	// Absolute path is more robust
     obj := objTC
     if !strings.HasPrefix(obj, "/") {
         wd, _ := os.Getwd()
         obj = wd + "/" + objTC
     }
 
-    // 1) BPF-Objekt laden und *Maps automatisch pinnen*
+	// 1) Load BPF object and automatically pin maps
     spec, err := ebpf.LoadCollectionSpec(obj)
     must(err, "load tc spec")
 
     coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
-        Maps: ebpf.MapOptions{ PinPath: "/sys/fs/bpf" }, // <- wichtig!
+	Maps: ebpf.MapOptions{ PinPath: "/sys/fs/bpf" }, // <- important!
     })
-    must(err, "new tc collection (pin maps)")
-    // coll.Close() NICHT sofort defer’n — erst wenn alles gepinnt ist
+	must(err, "new tc collection (pin maps)")
+	// Do not defer coll.Close() immediately — wait until everything is pinned
 
-    // 2) Programm holen und selbst pinnen
+	// 2) Retrieve program and pin it manually
     prog, ok := coll.Programs["tc_rl_prog"]
     if !ok { must(errors.New("prog tc_rl_prog not found"), "prog tc") }
-    must(prog.Pin("/sys/fs/bpf/tc_rl_prog"), "pin tc program")
+	must(prog.Pin("/sys/fs/bpf/tc_rl_prog"), "pin tc program")
 
-    // (Maps sind dank MapOptions bereits gepinnt: tc_rl_cfg, tc_rl_state, tc_rl6_state, tc_rl_policy4, tc_rl_policy6)
-    coll.Close() // FDs frei geben; Pins bleiben
+	// (Maps are already pinned thanks to MapOptions)
+	coll.Close() // free FDs; pins remain
 
-    // 3) clsact + Filter mit *pinned* Programm
+	// 3) clsact + filter using the *pinned* program
     _ = exec.Command("tc", "qdisc", "add", "dev", iface, "clsact").Run()
-    cmd := exec.Command("tc", "filter", "replace",
+	cmd := exec.Command("tc", "filter", "replace",
         "dev", iface,
         "ingress",
         "bpf", "direct-action",
@@ -435,7 +472,7 @@ func cmdAttachTC(iface string) {
     fmt.Printf("TC rate limiter attached on %s (ingress). Ctrl+C to exit.\n", iface)
     waitForSignal()
 
-    // Cleanup (optional)
+	// Cleanup (optional)
     _ = exec.Command("tc", "filter", "del", "dev", iface, "ingress").Run()
     _ = os.Remove("/sys/fs/bpf/tc_rl_prog")
 }
@@ -498,22 +535,22 @@ func usage() {
   # Attach XDP (allow → deny → pass, v4+v6)
   sudo ./net-guard attach-xdp -iface eth0
 
-  # Allowlist (CIDR; v4 und v6 automatisch erkannt)
+	# Allowlist (CIDR; v4 and v6 are auto-detected)
   sudo ./net-guard add-allow-cidr 203.0.113.0/24
   sudo ./net-guard add-allow-cidr 2a02:120:34::/48
   sudo ./net-guard del-allow-cidr 203.0.113.0/24
   sudo ./net-guard del-allow-cidr 2a02:120:34::/48
   sudo ./net-guard list-allow
 
-  # Denylist (Single IP; v4/v6 automatisch)
+	# Denylist (Single IP; v4/v6 auto-detected)
   sudo ./net-guard add-deny-ip 203.0.113.7
   sudo ./net-guard add-deny-ip 2a02:120:34::dead
   sudo ./net-guard del-deny-ip 203.0.113.7
   sudo ./net-guard del-deny-ip 2a02:120:34::dead
   sudo ./net-guard list-deny
 
-  # Enforce allowlist (default-deny außerhalb Allow)
-  sudo ./net-guard enforce-allow on|off|show
+	# Enforce allowlist (default-deny for addresses outside the allowlist)
+	sudo ./net-guard enforce-allow on|off|show
 
   # TC per-IP rate limiter (ingress)
   sudo ./net-guard attach-tc -iface eth0
@@ -602,7 +639,7 @@ func main() {
    	        b := fs.Uint64("burst", 10000, "max tokens")
   	        _ = fs.Parse(os.Args[2:])
                 if fs.NArg() != 1 {
-                    fmt.Println("tc-set-ip <IP> [-rate N] [-burst N]")
+                    fmt.Println("tc-set-ip [-rate N] [-burst N] <IP>")
                     os.Exit(2)
                 }
                 cmdTCSetIP(fs.Arg(0), *r, *b)
