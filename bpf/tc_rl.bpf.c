@@ -28,6 +28,24 @@ struct state_t {
     __u64 tokens;
 };
 
+/* ===================== Telemtry ===================== */
+
+struct tc_src_stats_t {
+    __u64 pkts;
+    __u64 bytes;
+    __u64 pass;
+    __u64 drop;        // rate-limit drop
+    __u64 last_seen_ns;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 131072);
+    __type(key, __u32); // IPv4 saddr (network order)
+    __type(value, struct tc_src_stats_t);
+    __uint(pinning, LIBBPF_PIN_BY_NAME); // /sys/fs/bpf/tc_rl_src4_stats
+} tc_rl_src4_stats SEC(".maps");
+
 /* ===================== Maps ===================== */
 
 // Debug counters (pinned at /sys/fs/bpf/tc_rl_dbg)
