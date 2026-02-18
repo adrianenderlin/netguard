@@ -46,7 +46,37 @@ const (
 	mapPinTCState = "/sys/fs/bpf/tc_rl_state"
 	mapPinTCPolicy4 = "/sys/fs/bpf/tc_rl_policy4"
         mapPinTCPolicy6 = "/sys/fs/bpf/tc_rl_policy6"
+
+	mapPinXDPTotals = "/sys/fs/bpf/xdp_totals"
+    mapPinXDPSrc4   = "/sys/fs/bpf/xdp_src4_stats"
+    mapPinXDPSrc6   = "/sys/fs/bpf/xdp_src6_stats" // optional
 )
+
+type xdpTotals struct {
+  Pkts, Bytes uint64
+
+  Pass, DropAllow, DropDeny uint64
+
+  V4, V6 uint64
+
+  Tcp, Udp, Icmp uint64
+
+  Syn, Synack, Rst uint64
+
+  DportChanges uint64
+}
+
+type xdpSrcStatsV4 struct {
+  Pkts, Bytes uint64
+  Tcp, Udp, Icmp uint64
+  Syn, Synack, Rst uint64
+  DropAllow, DropDeny uint64
+  LastSeenNs uint64
+  LastDport uint16
+  _pad      uint16 // Alignment (wichtig!)
+  DportChanges uint64
+}
+
 
 /* ==================== Helpers ==================== */
 
@@ -526,6 +556,42 @@ func cmdTCUnsetIP(ip string) {
     fmt.Printf("TC per-IP (v6) removed: %s\n", ip)
 }
 
+func cmdXDPTotals() {
+  m, err := openPinnedMap(mapPinXDPTotals)
+  must(err, "open xdp_totals")
+  defer m.Close()
+
+  ncpu, err := ebpf.PossibleCPU()
+  must(err, "PossibleCPU")
+
+  key := uint32(0)
+  vals := make([]xdpTotals, ncpu)
+
+  must(m.Lookup(&key, &vals), "lookup percpu totals")
+
+  var sum xdpTotals
+  for _, v := range vals {
+    sum.Pkts += v.Pkts
+    sum.Bytes += v.Bytes
+    sum.Pass += v.Pass
+    sum.DropAllow += v.DropAllow
+    sum.DropDeny += v.DropDeny
+    sum.V4 += v.V4
+    sum.V6 += v.V6
+    sum.Tcp += v.Tcp
+    sum.Udp += v.Udp
+    sum.Icmp += v.Icmp
+    sum.Syn += v.Syn
+    sum.Synack += v.Synack
+    sum.Rst += v.Rst
+    sum.DportChanges += v.DportChanges
+  }
+
+  fmt.Printf("pkts=%d bytes=%d pass=%d drop_allow=%d drop_deny=%d syn=%d synack=%d rst=%d dport_changes=%d\n",
+    sum.Pkts, sum.Bytes, sum.Pass, sum.DropAllow, sum.DropDeny, sum.Syn, sum.Synack, sum.Rst, sum.DportChanges)
+}
+
+
 
 /* ==================== CLI ==================== */
 
@@ -569,6 +635,9 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "xdp-totals":
+  		cmdXDPTotals()
+
 	case "attach-xdp":
 		fs := flag.NewFlagSet("attach-xdp", flag.ExitOnError)
 		iface := fs.String("iface", "eth0", "Interface")
